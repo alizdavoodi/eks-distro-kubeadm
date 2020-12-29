@@ -1,0 +1,12 @@
+apiVersion: kubeadm.k8s.io/v1beta2
+caCertPath: /etc/kubernetes/pki/ca.crt
+discovery:
+  bootstrapToken:
+    apiServerEndpoint: {{ K8S_API_ENDPOINT }}:6443
+    token: {{ KUBEADM_TOKEN }}
+    unsafeSkipCAVerification: true
+  timeout: 5m0s
+kind: JoinConfiguration
+nodeRegistration:
+  criSocket: {{ CRI_SOCKET }}
+  taints: null

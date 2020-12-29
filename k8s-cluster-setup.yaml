@@ -1,0 +1,150 @@
+---
+- name: Install eks-distro cluster prerequisites
+  hosts: all
+  tasks:
+
+  
+  - name: Check if kubeadm has already run
+    stat:
+      path: "/var/lib/kubelet/config.yaml"
+    register: kubeadm_already_run
+    delegate_to: "{{ groups['master'] | first }}"
+    run_once: yes
+
+  - name: install dependencies packages
+    apt:
+      name: "{{ item}}"
+      state: present
+    loop:
+      - socat
+      - conntrack
+
+  - name: copy install cri-o bash script 
+    copy: src=./install-cri.sh dest=/opt/install-cri.sh mode=0777
+  - name: run install cri-o bash script 
+    command: sh /opt/install-cri.sh
+
+  - name: Download binary/executable files
+    get_url:
+      url: "{{ item.url }}"
+      dest: "{{ item.dest }}"
+      checksum: "{{ item.checksum }}"
+      mode: "a+x"
+    loop:
+    - { url: "https://distro.eks.amazonaws.com/kubernetes-1-18/releases/1/artifacts/kubernetes/v1.18.9/bin/linux/amd64/kubelet", dest: "/usr/bin",  checksum: "sha256:97a27c8427b6cbdc0587055db337a85b3aee9bf3a5e6a28fda5431427b7c1a61"}
+    - { url: "https://distro.eks.amazonaws.com/kubernetes-1-18/releases/1/artifacts/kubernetes/v1.18.9/bin/linux/amd64/kubeadm", dest: "/usr/bin",  checksum: "sha256:ea1d4b2ce81d59ffcdaa3e24528ed86b906c16135cd12006c10f8aa3bdea2331"}
+    - { url: "https://distro.eks.amazonaws.com/kubernetes-1-18/releases/1/artifacts/kubernetes/v1.18.9/bin/linux/amd64/kubectl", dest: "/usr/bin",  checksum: "sha256:8d5e27347dbd49ef08f078dc8181750080dbbebd0f0f5e666a9787b11628b57a"}
+    - { url: "https://docs.projectcalico.org/manifests/calico.yaml", dest: "/tmp/calico.yaml",  checksum: "sha256:875ce529cdbb2ea46e17ec4bfeb4e5eeef3cd105591f097029245fc46f2b2c82"}
+
+  - name: Creates CNI directory
+    file:
+      path: /opt/cni/bin
+      state: directory
+  - name: Unarchive cni plugin binaries to /opt/cni/bin
+    unarchive:
+      src: https://distro.eks.amazonaws.com/kubernetes-1-18/releases/1/artifacts/plugins/v0.8.7/cni-plugins-linux-amd64-v0.8.7.tar.gz
+      dest: /opt/cni/bin
+      remote_src: yes
+
+  - name: create kubelet drop-in directory
+    file:
+      path: /etc/systemd/system/kubelet.service.d
+      state: directory
+
+  - name: copy drop-in kubelet system file
+    copy: src=./files/10-kubeadm.conf dest=/etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+
+  - name: copy kubelet systemd unit file
+    copy: src=./files/kubelet.service dest=/etc/systemd/system/kubelet.service
+
+  - name: start kubelet
+    systemd: state=started name=kubelet enabled=yes daemon_reload=yes 
+
+  # Generate token for initializing the cluster 
+  - block:
+      - name: generate kubeadm bootstrap token
+        command: kubeadm token generate
+        register: kubeadm_token
+        delegate_to: "{{ groups['master'] | first }}"
+        run_once: yes
+      - name: set fact kubeadm token
+        delegate_to: "{{ groups['master'] | first }}"
+        run_once: yes
+        set_fact:
+          KUBEADM_TOKEN: "{{ kubeadm_token.stdout }}"
+    when:
+    - not kubeadm_already_run.stat.exists
+
+  - block:
+      - name: generate kubeadm bootstrap token with 5h ttl
+        command: kubeadm token create --ttl 5h
+        register: kubeadm_token
+        delegate_to: "{{ groups['master'] | first }}"
+        run_once: yes
+      - name: set fact kubeadm token
+        delegate_to: "{{ groups['master'] | first }}"
+        run_once: yes
+        set_fact:
+          KUBEADM_TOKEN: "{{ kubeadm_token.stdout }}"
+    when:
+    - kubeadm_already_run.stat.exists
+
+- name: deploy eks-distro master
+  hosts: master
+  tasks:
+  - block:
+      - name: create kubeadm directory
+        file:
+          path: /opt/kubeadm
+          state: directory
+      - name: copy kubeadm init config file to master
+        template:
+          src: ./files/kubeadm-init.yaml.j2
+          dest: /opt/kubeadm/kubeadm-init.yaml
+          force: yes    
+
+      - name: run kubeadm init
+        command: >-
+          timeout -k 200s 200s
+          kubeadm init --config /opt/kubeadm/kubeadm-init.yaml --ignore-preflight-errors=ImagePull
+        register: kubeadm_init
+        until: kubeadm_init is succeeded or "field is immutable" in kubeadm_init.stderr
+        failed_when: kubeadm_init.rc != 0 and "field is immutable" not in kubeadm_init.stderr
+      
+      - name: deploy calico for network plugin
+        command: >-
+          kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /tmp/calico.yaml
+        register: calico_crd
+        until: calico_crd is succeeded
+        failed_when: calico_crd.rc != 0
+    when:
+    - not kubeadm_already_run.stat.exists
+    
+- name: deploy eks-distro node
+  hosts: nodes
+  tasks:
+  - name: Check if kubeadm has already run
+    stat:
+      path: "/var/lib/kubelet/config.yaml"
+    register: kubeadm_already_run_node
+  - block:
+    - name: create kubeadm directory
+      file:
+        path: /opt/kubeadm
+        state: directory
+    - name: copy kubeadm init config file to node
+      template:
+        src: ./files/kubeadm-join.yaml.j2
+        dest: /opt/kubeadm/kubeadm-join.yaml
+        force: yes    
+    - name: run kubeadm join
+      command: >-
+        timeout -k 200s 200s
+        kubeadm join --config /opt/kubeadm/kubeadm-join.yaml --ignore-preflight-errors=ImagePull
+      register: kubeadm_join
+      until: kubeadm_join is succeeded or "field is immutable" in kubeadm_join.stderr
+      failed_when: kubeadm_join.rc != 0 and "field is immutable" not in kubeadm_join.stderr
+    when:
+    - not kubeadm_already_run_node.stat.exists
+
+

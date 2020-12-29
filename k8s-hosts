@@ -1,0 +1,4 @@
+[master]
+192.168.122.157 # Change it to the master ip 
+[nodes]
+192.168.122.57 # Change it to the nodes ip
